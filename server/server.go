@@ -59,6 +59,11 @@ var (
 	errAccessDenied      = terror.ClassServer.New(codeAccessDenied, mysql.MySQLErrName[mysql.ErrAccessDenied])
 )
 
+const (
+	MysqlProtocol  = 1
+	MysqlXProtocol = 2
+)
+
 // Server is the MySQL protocol server
 type Server struct {
 	cfg               *config.Config
@@ -66,7 +71,8 @@ type Server struct {
 	listener          net.Listener
 	rwlock            *sync.RWMutex
 	concurrentLimiter *TokenLimiter
-	clients           map[uint32]*clientConn
+	typ               int
+	clients           map[uint32] clientConn
 
 	// When a critical error occurred, we don't want to exit the process, because there may be
 	// a supervisor automatically restart it, then new client connection will be created, but we can't server it.
@@ -91,10 +97,10 @@ func (s *Server) releaseToken(token *Token) {
 	s.concurrentLimiter.Put(token)
 }
 
-// newConn creates a new *xClientConn from a net.Conn.
+// newConn creates a new *ClientConn from a net.Conn.
 // It allocates a connection ID and random salt data for authentication.
-func (s *Server) newConn(conn net.Conn) *clientConn {
-	cc := &clientConn{
+func (s *Server) newConn(conn net.Conn) *mysqlClientConn {
+	cc := &mysqlClientConn{
 		conn:         conn,
 		pkt:          newPacketIO(conn),
 		server:       s,
@@ -121,22 +127,32 @@ func (s *Server) skipAuth() bool {
 const tokenLimit = 1000
 
 // NewServer creates a new Server.
-func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
+func NewServer(cfg *config.Config, driver IDriver, serverType int) (*Server, error) {
 	s := &Server{
 		cfg:               cfg,
 		driver:            driver,
 		concurrentLimiter: NewTokenLimiter(tokenLimit),
 		rwlock:            &sync.RWMutex{},
-		clients:           make(map[uint32]*clientConn),
+		typ:               serverType,
+		clients:           make(map[uint32]clientConn),
 		stopListenerCh:    make(chan struct{}, 1),
+	}
+
+	socket := cfg.Socket
+	addr := cfg.Addr
+	protocol := "MySQL"
+	if serverType == MysqlXProtocol {
+		socket = cfg.XSocket
+		addr   = cfg.XAddr
+		protocol = "MySQL X"
 	}
 
 	var err error
 	if cfg.Socket != "" {
 		cfg.SkipAuth = true
-		s.listener, err = net.Listen("unix", cfg.Socket)
+		s.listener, err = net.Listen("unix", socket)
 	} else {
-		s.listener, err = net.Listen("tcp", s.cfg.Addr)
+		s.listener, err = net.Listen("tcp", addr)
 	}
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -144,7 +160,7 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 
 	// Init rand seed for randomBuf()
 	rand.Seed(time.Now().UTC().UnixNano())
-	log.Infof("Server run MySQL Protocol Listen at [%s]", s.cfg.Addr)
+	log.Infof("Server run %s Protocol Listen at [%s]", protocol, s.cfg.Addr)
 	return s, nil
 }
 
@@ -201,9 +217,9 @@ func (s *Server) Close() {
 
 // onConn runs in its own goroutine, handles queries from this connection.
 func (s *Server) onConn(c net.Conn) {
-	conn := s.newConn(c)
+	conn := createClientConn(c, s)
 	defer func() {
-		log.Infof("[%d] close connection", conn.connectionID)
+		log.Infof("[%d] close connection", conn.id())
 	}()
 
 	if err := conn.handshake(); err != nil {
@@ -215,7 +231,7 @@ func (s *Server) onConn(c net.Conn) {
 	}
 
 	s.rwlock.Lock()
-	s.clients[conn.connectionID] = conn
+	s.clients[conn.id()] = conn
 	connections := len(s.clients)
 	s.rwlock.Unlock()
 	connGauge.Set(float64(connections))
@@ -228,10 +244,10 @@ func (s *Server) ShowProcessList() []util.ProcessInfo {
 	var rs []util.ProcessInfo
 	s.rwlock.RLock()
 	for _, client := range s.clients {
-		if client.killed {
+		if client.isKilled() {
 			continue
 		}
-		rs = append(rs, client.ctx.ShowProcess())
+		rs = append(rs, client.showProcess())
 	}
 	s.rwlock.RUnlock()
 	return rs
@@ -247,10 +263,7 @@ func (s *Server) Kill(connectionID uint64, query bool) {
 		return
 	}
 
-	conn.ctx.Cancel()
-	if !query {
-		conn.killed = true
-	}
+	conn.Cancel(query)
 }
 
 // Server error codes.
